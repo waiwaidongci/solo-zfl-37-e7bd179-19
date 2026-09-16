@@ -91,20 +91,42 @@ async function startServerOn(serverPath, env = {}) {
   };
 }
 
-/** 确定地终止一个子进程：先 TERM 等退出，超时 KILL 兜底；返回后进程必已回收 */
-function killChild(child, signal = "SIGTERM") {
-  if (child.exitCode !== null || child.signalCode) return Promise.resolve();
+/**
+ * 等待子进程退出，且不受“exit 事件早于监听注册发射”影响：
+ * EventEmitter 不会重放已发射的事件，因此注册前必须先判死，
+ * 否则会永久等待一个不会再来的事件（事件循环空转 → 测试被取消）。
+ * 同步检查与 once 注册之间没有 await，不存在交错窗口。
+ */
+function waitExit(child, timeoutMs = 8000) {
+  const dead = (c) => (c.exitCode !== null || c.signalCode !== null
+    ? { code: c.exitCode, signal: c.signalCode }
+    : null);
+  if (dead(child)) return Promise.resolve(dead(child));
   return new Promise((resolve) => {
     let settled = false;
-    const finish = () => { if (!settled) { settled = true; clearTimeout(timer); resolve(); } };
+    const finish = (val) => { if (!settled) { settled = true; clearTimeout(timer); resolve(val); } };
     const timer = setTimeout(() => {
+      // 预期的自退出/崩溃迟迟不来：强杀并等待回收，避免游离进程与永久等待
       try { child.kill("SIGKILL"); } catch {}
-      child.once("exit", finish);
-      setTimeout(finish, 1000); // 极端情况下也不永久挂起
-    }, 4000);
-    child.once("exit", finish);
-    try { child.kill(signal); } catch { finish(); }
+      if (dead(child)) return finish(dead(child));
+      child.once("exit", (code, signal) => finish({ code, signal, forced: true }));
+      setTimeout(() => finish(dead(child) || { timeout: true }), 2000);
+    }, timeoutMs);
+    child.once("exit", (code, signal) => finish({ code, signal }));
+    // 兜底：极端情况下事件恰好在检查与注册之间发射（理论上同步代码不会，但保持幂等）
+    if (dead(child)) finish(dead(child));
   });
+}
+
+/** 确定地终止一个子进程：先 TERM 等待退出，超时 KILL 升级；返回后进程必已回收 */
+async function killChild(child, signal = "SIGTERM") {
+  if (child.exitCode !== null || child.signalCode) return;
+  try { child.kill(signal); } catch { return; }
+  let result = await waitExit(child, 4000);
+  if (result.timeout) {
+    try { child.kill("SIGKILL"); } catch {}
+    result = await waitExit(child, 3000);
+  }
 }
 
 /** 启动一个使用独立数据目录的服务进程 */
@@ -522,7 +544,7 @@ test("恢复中进程崩溃/重启：回到恢复前状态，写入恢复可用"
       body: JSON.stringify({ pointId: f.json.point.id, restoreId: rid }),
     }).catch(() => null);
     assert.ok(resp === null || resp.status >= 500 || resp.status === undefined, "进程崩溃，连接失败");
-    await new Promise((r) => crashChild.on("exit", r));
+    await waitExit(crashChild);
     children.delete(crashChild);
 
     // 磁盘上残留 in_progress 日志 + 备份
@@ -825,8 +847,7 @@ test("缺陷2回归-重启：崩溃后首次重启回滚失败保留备份，磁
     const preCodes = (await req(base, "/api/items")).json.map((i) => i.code).sort();
 
     // 恢复落盘后直接崩溃 → 残留 in_progress + 备份
-    child.kill("SIGTERM");
-    await new Promise((r) => child.on("exit", r));
+    await killChild(child);
     const crashChild = spawnOne({ RECOVERY_CRASH: "after_write" });
     await waitReady(crashChild);
     const rid = "rb-fail-restart-0001";
@@ -835,7 +856,7 @@ test("缺陷2回归-重启：崩溃后首次重启回滚失败保留备份，磁
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ pointId: f.json.point.id, restoreId: rid }),
     }).catch(() => {});
-    await new Promise((r) => crashChild.on("exit", r));
+    await waitExit(crashChild);
     assert.ok(existsSync(join(dir, "recovery", `backup-${rid}.json`)));
 
     // 第一次重启：磁盘仍故障，重演回滚失败 → rollback_failed，备份仍在；
@@ -853,8 +874,7 @@ test("缺陷2回归-重启：崩溃后首次重启回滚失败保留备份，磁
     assert.equal(failAgain.status, 500);
 
     // 磁盘恢复：重启后重演成功 → 回到恢复前
-    child.kill("SIGTERM");
-    await new Promise((r) => child.on("exit", r));
+    await killChild(child);
     child = spawnOne();
     await waitReady(child);
     const after = (await req(base, "/api/items")).json;
@@ -863,8 +883,7 @@ test("缺陷2回归-重启：崩溃后首次重启回滚失败保留备份，磁
     assert.equal(journal.status, "rolled_back");
     assert.ok(!existsSync(join(dir, "recovery", `backup-${rid}.json`)));
 
-    child.kill("SIGTERM");
-    await new Promise((r) => child.on("exit", r));
+    await killChild(child);
   } finally {
     await stopAll();
     await rm(dir, { recursive: true, force: true });
@@ -1062,8 +1081,7 @@ test("重启进入待找回：重启后仍拒绝写入，再次重启磁盘恢�
     await waitReady(child);
     const f = await req(base, "/api/recovery/points", { method: "POST", body: JSON.stringify({ kind: "full" }) });
     await createItem(base, "Q-01");
-    child.kill("SIGTERM");
-    await new Promise((r) => child.on("exit", r));
+    await killChild(child);
 
     // 恢复落盘后崩溃
     const crashChild = spawnOne({ RECOVERY_CRASH: "after_write" });
@@ -1073,7 +1091,7 @@ test("重启进入待找回：重启后仍拒绝写入，再次重启磁盘恢�
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ pointId: f.json.point.id, restoreId: rid }),
     }).catch(() => {});
-    await new Promise((r) => crashChild.on("exit", r));
+    await waitExit(crashChild);
 
     // 首次重启：磁盘仍故障 → 待找回，写入被拒
     child = spawnOne({ RECOVERY_REPLAY_ROLLBACK_FAULT: "1" });
@@ -1086,8 +1104,7 @@ test("重启进入待找回：重启后仍拒绝写入，再次重启磁盘恢�
     assert.equal((await req(base, "/api/items")).status, 200, "读取仍可用");
 
     // 磁盘恢复：再次重启，重演回滚成功 → 找回数据、写入放行
-    child.kill("SIGTERM");
-    await new Promise((r) => child.on("exit", r));
+    await killChild(child);
     child = spawnOne();
     await waitReady(child);
     const st2 = (await req(base, "/api/recovery/status")).json;
@@ -1096,10 +1113,41 @@ test("重启进入待找回：重启后仍拒绝写入，再次重启磁盘恢�
     assert.ok(items.some((i) => i.code === "Q-01"), "恢复前数据找回");
     const okWrite = await req(base, "/api/items", { method: "POST", body: JSON.stringify({ code: "Q-AFTER" }) });
     assert.equal(okWrite.status, 201);
-    child.kill("SIGTERM");
-    await new Promise((r) => child.on("exit", r));
+    await killChild(child);
   } finally {
     await stopAll();
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("收尾竞态回归：exit 事件早于监听注册时 waitExit 不永久空转", async () => {
+  // 模拟“进程退出通知比测试注册监听更早”：子进程立即退出，稍后才 await waitExit
+  const spawnQuickExit = (code = 0) =>
+    spawn(process.execPath, ["-e", `process.exit(${code})`], { stdio: "ignore" });
+
+  // 1) 已退出后才等待：必须立即解析为退出结果
+  const c1 = spawnQuickExit(0);
+  await new Promise((r) => c1.on("exit", r)); // 确保事件已经发射完毕
+  const t0 = Date.now();
+  const r1 = await waitExit(c1, 3000);
+  assert.equal(r1.code, 0, "已退出进程应立即返回其退出码");
+  assert.ok(Date.now() - t0 < 500, "不应等待超时");
+
+  // 2) 等待一个稍后自行退出的进程
+  const c2 = spawn(process.execPath, ["-e", "setTimeout(()=>process.exit(7),60)"], { stdio: "ignore" });
+  const r2 = await waitExit(c2, 3000);
+  assert.equal(r2.code, 7);
+
+  // 3) 等一个“不会自己退出”的进程：waitExit 超时应强杀并回收，不残留
+  const c3 = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
+  await new Promise((r) => setTimeout(r, 120));
+  const r3 = await waitExit(c3, 300); // 给很短超时
+  assert.equal(r3.code, null);
+  assert.ok(r3.signal === "SIGKILL" || r3.forced || r3.timeout, "超时后应被强杀回收");
+  await waitExit(c3, 1000); // 再次调用对已死进程立即返回（幂等）
+
+  // 4) killChild 对“已经自己退出”的进程也立即返回、不抛错
+  const c4 = spawnQuickExit(0);
+  await new Promise((r) => setTimeout(r, 120));
+  await killChild(c4);
 });
