@@ -28,75 +28,93 @@ async function freePort() {
   });
 }
 
-/** 启动一个使用独立数据目录的服务进程 */
-async function startServer(env = {}) {
-  const dir = await mkdtemp(join(tmpdir(), "ink-recovery-"));
-  const port = await freePort();
-  const child = spawn(process.execPath, [SERVER], {
-    env: { ...process.env, DATA_DIR: dir, PORT: String(port), ...env },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let logs = "";
-  child.stdout.on("data", (d) => (logs += d));
-  child.stderr.on("data", (d) => (logs += d));
-  const base = `http://127.0.0.1:${port}`;
-  // 等待端口就绪
-  await new Promise((resolve, reject) => {
-    const deadline = Date.now() + 8000;
-    const tick = async () => {
-      try {
-        const res = await fetch(base + "/api/items");
-        if (res.ok) return resolve();
-      } catch {}
-      if (Date.now() > deadline) return reject(new Error("server not ready\n" + logs));
-      setTimeout(tick, 60);
-    };
-    tick();
-  });
-  return {
-    dir,
-    base,
-    logs: () => logs,
-    stop: async () => {
-      child.kill("SIGTERM");
-      await new Promise((r) => child.on("exit", r));
-    },
-    stopHard: async () => {
-      child.kill("SIGKILL");
-      await new Promise((r) => child.on("exit", r));
-    },
-  };
-}
+/**
+ * 启动一个子服务进程并返回可控句柄。
+ * - 就绪轮询失败也会先杀掉子进程，绝不残留；
+ * - stop() 先 SIGTERM，超时再 SIGKILL，保证每个子进程都有确定收尾；
+ * - 所有句柄登记到 process 退出钩子，异常路径也不泄漏。
+ */
+const liveChildren = new Set();
+process.on("exit", () => {
+  for (const child of liveChildren) {
+    try { child.kill("SIGKILL"); } catch {}
+  }
+});
 
-/** 启动一个指定 server.js 路径（可在含空格的目录）的服务进程 */
-async function startServerFile(serverPath, env = {}) {
+async function startServerOn(serverPath, env = {}) {
   const dir = await mkdtemp(join(tmpdir(), "ink-recovery-"));
   const port = await freePort();
   const child = spawn(process.execPath, [serverPath], {
     env: { ...process.env, DATA_DIR: dir, PORT: String(port), ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  liveChildren.add(child);
+  child.on("exit", () => liveChildren.delete(child));
   let logs = "";
   child.stdout.on("data", (d) => (logs += d));
   child.stderr.on("data", (d) => (logs += d));
+
   const base = `http://127.0.0.1:${port}`;
+  let exited = null;
+  child.on("exit", (code, signal) => { exited = { code, signal }; });
+
+  // 等端口就绪；失败或子进程提前退出都 reject，并由外层 stop/钩子清理
   await new Promise((resolve, reject) => {
-    const deadline = Date.now() + 8000;
+    const deadline = Date.now() + 10000;
     const tick = async () => {
+      if (exited) return reject(new Error("子进程提前退出 " + JSON.stringify(exited) + "\n" + logs));
       try {
         const res = await fetch(base + "/api/items");
         if (res.ok) return resolve();
       } catch {}
-      if (Date.now() > deadline) return reject(new Error("server not ready: " + serverPath + "\n" + logs));
-      setTimeout(tick, 60);
+      if (Date.now() > deadline) return reject(new Error("server not ready\n" + logs));
+      setTimeout(tick, 50);
     };
     tick();
+  }).catch(async (err) => {
+    await killChild(child);
+    throw err;
   });
-  return {
-    dir, base,
-    logs: () => logs,
-    stop: async () => { child.kill("SIGTERM"); await new Promise((r) => child.on("exit", r)); },
+
+  // 终止子进程后清理该服务独占的临时数据目录（崩溃/重启类用例自带目录，不经此 helper）
+  const stopAndClean = async (signal) => {
+    await killChild(child, signal);
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
   };
+  return {
+    dir,
+    base,
+    logs: () => logs,
+    child,
+    stop: () => stopAndClean("SIGTERM"),
+    stopHard: () => stopAndClean("SIGKILL"),
+  };
+}
+
+/** 确定地终止一个子进程：先 TERM 等退出，超时 KILL 兜底；返回后进程必已回收 */
+function killChild(child, signal = "SIGTERM") {
+  if (child.exitCode !== null || child.signalCode) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => { if (!settled) { settled = true; clearTimeout(timer); resolve(); } };
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+      child.once("exit", finish);
+      setTimeout(finish, 1000); // 极端情况下也不永久挂起
+    }, 4000);
+    child.once("exit", finish);
+    try { child.kill(signal); } catch { finish(); }
+  });
+}
+
+/** 启动一个使用独立数据目录的服务进程 */
+function startServer(env = {}) {
+  return startServerOn(SERVER, env);
+}
+
+/** 启动一个指定 server.js 路径（可在含空格的目录）的服务进程 */
+function startServerFile(serverPath, env = {}) {
+  return startServerOn(serverPath, env);
 }
 
 async function req(base, path, opts = {}) {
@@ -450,19 +468,30 @@ test("恢复失败自动回滚到恢复前状态，且同一请求不能再次�
 test("恢复中进程崩溃/重启：回到恢复前状态，写入恢复可用", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ink-recovery-crash-"));
   const port = await freePort();
-  const spawnOne = () =>
-    spawn(process.execPath, [SERVER], {
-      env: { ...process.env, DATA_DIR: dir, PORT: String(port) },
+  const children = new Set();
+  const spawnOne = (extra = {}) => {
+    const c = spawn(process.execPath, [SERVER], {
+      env: { ...process.env, DATA_DIR: dir, PORT: String(port), ...extra },
       stdio: ["ignore", "pipe", "pipe"],
     });
+    children.add(c);
+    c.on("exit", () => children.delete(c));
+    return c;
+  };
+  const stopAll = async () => {
+    await Promise.all([...children].map((c) => killChild(c)));
+  };
   const waitReady = async (child) => {
     const base = `http://127.0.0.1:${port}`;
     let err = "";
     child.stderr.on("data", (d) => (err += d));
     child.stdout.on("data", () => {});
+    let exited = null;
+    child.on("exit", (code, signal) => { exited = { code, signal }; });
     await new Promise((resolve, reject) => {
       const deadline = Date.now() + 8000;
       const tick = async () => {
+        if (exited) return reject(new Error("子进程提前退出 " + JSON.stringify(exited) + ": " + err));
         try {
           const res = await fetch(base + "/api/items");
           if (res.ok) return resolve();
@@ -483,12 +512,8 @@ test("恢复中进程崩溃/重启：回到恢复前状态，写入恢复可用"
     assert.equal((await req(base, "/api/items")).json.length, 4);
 
     // 用故障进程在落盘后直接退出
-    child.kill("SIGTERM");
-    await new Promise((r) => child.on("exit", r));
-    const crashChild = spawn(process.execPath, [SERVER], {
-      env: { ...process.env, DATA_DIR: dir, PORT: String(port), RECOVERY_CRASH: "after_write" },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    await killChild(child);
+    const crashChild = spawnOne({ RECOVERY_CRASH: "after_write" });
     await waitReady(crashChild);
     const rid = "crash-restore-0001";
     const resp = await fetch(base + "/api/recovery/restore", {
@@ -498,6 +523,7 @@ test("恢复中进程崩溃/重启：回到恢复前状态，写入恢复可用"
     }).catch(() => null);
     assert.ok(resp === null || resp.status >= 500 || resp.status === undefined, "进程崩溃，连接失败");
     await new Promise((r) => crashChild.on("exit", r));
+    children.delete(crashChild);
 
     // 磁盘上残留 in_progress 日志 + 备份
     assert.ok(existsSync(join(dir, "recovery", "journals", rid + ".json")));
@@ -526,9 +552,8 @@ test("恢复中进程崩溃/重启：回到恢复前状态，写入恢复可用"
       body: JSON.stringify({ pointId: f.json.point.id, restoreId: rid }),
     });
     assert.equal(dup.status, 409);
-    child.kill("SIGTERM");
-    await new Promise((r) => child.on("exit", r));
   } finally {
+    await stopAll();
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -773,8 +798,8 @@ test("缺陷2回归-重启：崩溃后首次重启回滚失败保留备份，磁
     return c;
   };
   const stopAll = async () => {
-    for (const c of children) c.kill("SIGTERM");
-    await Promise.all([...children].map((c) => new Promise((r) => c.on("exit", r)))).catch(() => {});
+    const pending = [...children];
+    await Promise.all(pending.map((c) => killChild(c)));
   };
   const waitReady = async (child) => {
     let err = "";
@@ -1029,8 +1054,8 @@ test("重启进入待找回：重启后仍拒绝写入，再次重启磁盘恢�
     });
   };
   const stopAll = async () => {
-    for (const c of children) c.kill("SIGTERM");
-    await Promise.all([...children].map((c) => new Promise((r) => c.on("exit", r)))).catch(() => {});
+    const pending = [...children];
+    await Promise.all(pending.map((c) => killChild(c)));
   };
   try {
     let child = spawnOne();
