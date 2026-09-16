@@ -53,9 +53,29 @@ class Mutex {
 const writeLock = new Mutex();
 let db = { items: [] };
 let restoreActive = null; // 恢复进行中时保存 restoreId
+let pendingRollbackIds = []; // rollback_failed（待找回）的恢复请求
 let idCounter = 0;
 
 const engine = new RecoveryEngine({ dir: recoveryDir });
+
+/** 从磁盘刷新“待找回回滚”清单（回滚写失败、需重试找回恢复前数据的恢复） */
+async function refreshPendingRollbacks() {
+  pendingRollbackIds = (await engine.listPendingRollbacks()).map((j) => j.restoreId);
+  return pendingRollbackIds;
+}
+
+/** 业务写入闸门：恢复进行中或存在待找回回滚时一律拒绝（读取与恢复台不受影响） */
+function assertWritable() {
+  if (restoreActive)
+    throw new RecoveryError(409, "restore_in_progress", "数据恢复进行中，期间禁止写入");
+  if (pendingRollbackIds.length)
+    throw new RecoveryError(
+      409,
+      "rollback_in_progress",
+      "存在未完成的回滚（待找回恢复前数据），请先在恢复台重试回滚成功后再写入",
+      { pendingRollbackIds }
+    );
+}
 
 /* ---------------- 存储 ---------------- */
 
@@ -83,14 +103,13 @@ async function initStorage() {
 }
 
 /**
- * 所有写操作经此入口：恢复期间一律拒绝；否则串行化并原子落盘。
+ * 所有业务写操作经此入口：恢复进行中或处于待找回状态时一律拒绝；
+ * 否则串行化并原子落盘。
  */
 async function mutate(fn) {
-  if (restoreActive)
-    throw new RecoveryError(409, "restore_in_progress", "数据恢复进行中，期间禁止写入");
+  assertWritable();
   return writeLock.run(async () => {
-    if (restoreActive)
-      throw new RecoveryError(409, "restore_in_progress", "数据恢复进行中，期间禁止写入");
+    assertWritable();
     const result = await fn();
     await persist({ items: db.items });
     return result;
@@ -123,11 +142,27 @@ const faultPhase = process.env.RECOVERY_FAULT || null;
 const crashPhase = process.env.RECOVERY_CRASH || null;
 const rollbackFault = process.env.RECOVERY_ROLLBACK_FAULT === "1";
 const replayRollbackFault = process.env.RECOVERY_REPLAY_ROLLBACK_FAULT === "1";
-const recoverRollbackFault = process.env.RECOVERY_RECOVER_ROLLBACK_FAULT === "1" || replayRollbackFault;
+const recoverRollbackFault = process.env.RECOVERY_RECOVER_ROLLBACK_FAULT === "1";
 
 let inflightRestore = null; // { rid, promise }
 
 async function performRestore(restoreId, pointId) {
+  if (restoreActive) {
+    // 恢复进行中：同一请求并发由下方去重；不同请求直接拒绝
+    if (inflightRestore && inflightRestore.rid === restoreId) {
+      const result = await inflightRestore.promise;
+      return { ...result, deduplicated: true, coalesced: true };
+    }
+    throw new RecoveryError(409, "restore_in_progress", "已有恢复正在进行：" + restoreActive);
+  }
+  // 待找回状态：同一失败请求交给引擎返回 rollback_incomplete；其它新恢复一律拒绝
+  if (pendingRollbackIds.length && !pendingRollbackIds.includes(restoreId))
+    throw new RecoveryError(
+      409,
+      "rollback_in_progress",
+      "存在未完成的回滚（待找回恢复前数据），请先重试回滚成功后再发起新恢复",
+      { pendingRollbackIds }
+    );
   // 同一个恢复请求并发到达：共用同一次执行，重复请求只执行一次
   if (inflightRestore) {
     if (inflightRestore.rid !== restoreId)
@@ -143,6 +178,7 @@ async function performRestore(restoreId, pointId) {
     return await promise;
   } finally {
     inflightRestore = null;
+    await refreshPendingRollbacks().catch(() => {});
   }
 }
 
@@ -172,15 +208,27 @@ async function runRestore(restoreId, pointId) {
       });
       return result;
     } finally {
+      // 仍持有写锁时先刷新待找回清单，再解除恢复标记：保证锁队列里的写入被正确拒绝或放行，无竞态窗口
+      await refreshPendingRollbacks().catch(() => {});
       restoreActive = null;
     }
   });
 }
 
-async function assertNotRestoring() {
+/** 恢复台“可执行写操作”闸门：恢复进行中或待找回时，禁止建点/删除/钉住/配置等改动 */
+function assertRecoveryIdle() {
   if (restoreActive)
     throw new RecoveryError(409, "restore_in_progress", "数据恢复进行中，该操作暂不可用");
+  if (pendingRollbackIds.length)
+    throw new RecoveryError(
+      409,
+      "rollback_in_progress",
+      "存在未完成的回滚（待找回恢复前数据），请先重试回滚成功后再操作恢复点",
+      { pendingRollbackIds }
+    );
 }
+// 兼容旧名称
+const assertNotRestoring = assertRecoveryIdle;
 
 /* ---------------- HTTP 辅助 ---------------- */
 
@@ -290,6 +338,7 @@ function page() {
       try {
         const st = await api('/api/recovery/status');
         if (st.restoreActive) { banner.style.display='block'; banner.textContent='⚠ 数据恢复进行中（'+st.restoreActive+'），所有写入已暂停'; }
+        else if (st.pendingRollbacks && st.pendingRollbacks.length) { banner.style.display='block'; banner.innerHTML='⚠ 有恢复回滚未完成（待找回恢复前数据），已锁定全部写入。请前往 <a href="/recovery" style="color:inherit;font-weight:700;text-decoration:underline">数据恢复台</a> 点击「重试回滚找回数据」。'; }
         else banner.style.display='none';
       } catch {}
     }
@@ -376,8 +425,10 @@ const server = http.createServer(async (req, res) => {
         engine.listJournals(),
         engine.listPendingRollbacks(),
       ]);
+      pendingRollbackIds = pendingRollbacks.map((j) => j.restoreId);
       return send(res, 200, {
         restoreActive,
+        writable: !restoreActive && pendingRollbacks.length === 0,
         journals: journals.slice(0, 10),
         pendingRollbacks,
       });
@@ -454,17 +505,25 @@ const server = http.createServer(async (req, res) => {
     const retryRollbackRoute = p.match(/^\/api\/recovery\/restore\/([^/]+)\/recover-rollback$/);
     if (retryRollbackRoute && req.method === "POST") {
       const rid = decodeURIComponent(retryRollbackRoute[1]);
-      await assertNotRestoring();
-      const result = await writeLock.run(() =>
-        engine.recoverRollback(rid, {
-          writeDb: async (content) => {
-            if (recoverRollbackFault) throw new Error("注入的重试回滚写入故障");
-            await persist(content);
-            await loadDbFromDisk();
-          },
-        })
-      );
-      return send(res, 200, result);
+      // 待找回状态正是要由该端点解除的：只阻止“恢复进行中”，不阻止待找回重试
+      if (restoreActive)
+        throw new RecoveryError(409, "restore_in_progress", "数据恢复进行中，该操作暂不可用");
+      try {
+        const result = await writeLock.run(() =>
+          engine.recoverRollback(rid, {
+            writeDb: async (content) => {
+              if (recoverRollbackFault) throw new Error("注入的重试回滚写入故障");
+              await persist(content);
+              await loadDbFromDisk();
+            },
+          })
+        );
+        await refreshPendingRollbacks();
+        return send(res, 200, result);
+      } catch (error) {
+        await refreshPendingRollbacks();
+        throw error;
+      }
     }
 
     send(res, 404, { error: "not_found" });
@@ -487,6 +546,7 @@ async function start() {
     },
   });
   for (const r of replay.recovered) console.log("[recovery] 中断恢复处理：", JSON.stringify(r));
+  await refreshPendingRollbacks();
   server.listen(port, () => console.log("墨锭试磨室 listening on http://localhost:" + port));
 }
 

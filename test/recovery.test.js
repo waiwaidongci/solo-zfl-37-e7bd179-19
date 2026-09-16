@@ -813,8 +813,9 @@ test("缺陷2回归-重启：崩溃后首次重启回滚失败保留备份，磁
     await new Promise((r) => crashChild.on("exit", r));
     assert.ok(existsSync(join(dir, "recovery", `backup-${rid}.json`)));
 
-    // 第一次重启：磁盘仍故障，重演回滚失败 → rollback_failed，备份仍在
-    child = spawnOne({ RECOVERY_REPLAY_ROLLBACK_FAULT: "1" });
+    // 第一次重启：磁盘仍故障，重演回滚失败 → rollback_failed，备份仍在；
+    // 同时让在线重试回滚也失败（磁盘尚未恢复）
+    child = spawnOne({ RECOVERY_REPLAY_ROLLBACK_FAULT: "1", RECOVERY_RECOVER_ROLLBACK_FAULT: "1" });
     await waitReady(child);
     let journal = (await req(base, "/api/recovery/restore/" + rid)).json;
     assert.equal(journal.status, "rollback_failed", "回滚失败不能误报已回滚");
@@ -928,5 +929,152 @@ test("缺陷3回归：手机窄屏无横向溢出，恢复点表格/按钮/状�
   } finally {
     await browser?.close();
     await srv.stop();
+  }
+});
+
+test("待找回状态：建档/状态/日志/试磨全部拒绝，读取与恢复台可用，重试回滚成功后放行", async () => {
+  const srv = await startServer({ RECOVERY_FAULT: "after_write", RECOVERY_ROLLBACK_FAULT: "1" });
+  try {
+    const f = await makePoint(srv.base, "full", "待找回闸门基线");
+    await createItem(srv.base, "P-01");
+    const someId = (await req(srv.base, "/api/items")).json[0].id;
+    const rid = "pending-lock-0001";
+    const r = await req(srv.base, "/api/recovery/restore", {
+      method: "POST",
+      body: JSON.stringify({ pointId: f.json.point.id, restoreId: rid }),
+    });
+    assert.equal(r.status, 500);
+    assert.equal(r.json.error, "rollback_incomplete");
+
+    // 状态接口报告不可写、存在待找回回滚
+    const st0 = (await req(srv.base, "/api/recovery/status")).json;
+    assert.equal(st0.writable, false);
+    assert.ok(st0.pendingRollbacks.some((j) => j.restoreId === rid));
+
+    // 四类业务写入一律 409 rollback_in_progress
+    const writes = [
+      req(srv.base, "/api/items", { method: "POST", body: JSON.stringify({ code: "P-X" }) }),
+      req(srv.base, `/api/items/${someId}`, { method: "PATCH", body: JSON.stringify({ status: "重点观察" }) }),
+      req(srv.base, `/api/items/${someId}/logs`, { method: "POST", body: JSON.stringify({ note: "n" }) }),
+      req(srv.base, `/api/items/${someId}/action`, { method: "POST", body: JSON.stringify({ score: 90 }) }),
+    ];
+    const results = await Promise.all(writes);
+    for (const w of results) {
+      assert.equal(w.status, 409);
+      assert.equal(w.json.error, "rollback_in_progress");
+    }
+    // 并发写入也全部被拒（无一漏入）
+    const race = await Promise.all(Array.from({ length: 6 }, (_, i) =>
+      req(srv.base, "/api/items", { method: "POST", body: JSON.stringify({ code: "P-RACE-" + i }) })));
+    assert.ok(race.every((x) => x.status === 409));
+
+    // 恢复点改动同样被锁定
+    const mkPointBlocked = await req(srv.base, "/api/recovery/points", { method: "POST", body: JSON.stringify({ kind: "incremental" }) });
+    assert.equal(mkPointBlocked.status, 409);
+    assert.equal(mkPointBlocked.json.error, "rollback_in_progress");
+
+    // 读取与恢复台只读功能仍可用
+    assert.equal((await req(srv.base, "/api/items")).status, 200);
+    assert.equal((await req(srv.base, "/api/stats")).status, 200);
+    assert.equal((await req(srv.base, "/api/recovery/overview")).status, 200);
+    assert.equal((await req(srv.base, "/api/recovery/validate", { method: "POST" })).status, 200);
+
+    // 新的恢复请求被拒；同一失败 rid 得到 rollback_incomplete
+    const other = await req(srv.base, "/api/recovery/restore", {
+      method: "POST", body: JSON.stringify({ pointId: f.json.point.id, restoreId: "another-rid-0002" }),
+    });
+    assert.equal(other.status, 409);
+    assert.equal(other.json.error, "rollback_in_progress");
+
+    // 在线重试回滚成功（重试端点不再注入回滚故障）
+    const rec = await req(srv.base, `/api/recovery/restore/${rid}/recover-rollback`, { method: "POST" });
+    assert.equal(rec.status, 200);
+    assert.equal(rec.json.journal.status, "rolled_back");
+
+    // 闸门解除：写入恢复
+    const st1 = (await req(srv.base, "/api/recovery/status")).json;
+    assert.equal(st1.writable, true);
+    assert.equal(st1.pendingRollbacks.length, 0);
+    const nowWrite = await req(srv.base, "/api/items", { method: "POST", body: JSON.stringify({ code: "P-AFTER", status: "待试磨" }) });
+    assert.equal(nowWrite.status, 201);
+  } finally {
+    await srv.stop();
+  }
+});
+
+test("重启进入待找回：重启后仍拒绝写入，再次重启磁盘恢复并找回后放行", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ink-pending-restart-"));
+  const port = await freePort();
+  const base = `http://127.0.0.1:${port}`;
+  const children = new Set();
+  const spawnOne = (extra = {}) => {
+    const c = spawn(process.execPath, [SERVER], {
+      env: { ...process.env, DATA_DIR: dir, PORT: String(port), ...extra },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    children.add(c);
+    c.on("exit", () => children.delete(c));
+    return c;
+  };
+  const waitReady = async (c) => {
+    let err = "";
+    c.stderr.on("data", (d) => (err += d));
+    await new Promise((resolve, reject) => {
+      const deadline = Date.now() + 8000;
+      (async function tick() {
+        try { if ((await fetch(base + "/api/items")).ok) return resolve(); } catch {}
+        if (Date.now() > deadline) return reject(new Error("not ready: " + err));
+        setTimeout(tick, 60);
+      })();
+    });
+  };
+  const stopAll = async () => {
+    for (const c of children) c.kill("SIGTERM");
+    await Promise.all([...children].map((c) => new Promise((r) => c.on("exit", r)))).catch(() => {});
+  };
+  try {
+    let child = spawnOne();
+    await waitReady(child);
+    const f = await req(base, "/api/recovery/points", { method: "POST", body: JSON.stringify({ kind: "full" }) });
+    await createItem(base, "Q-01");
+    child.kill("SIGTERM");
+    await new Promise((r) => child.on("exit", r));
+
+    // 恢复落盘后崩溃
+    const crashChild = spawnOne({ RECOVERY_CRASH: "after_write" });
+    await waitReady(crashChild);
+    const rid = "pending-restart-0001";
+    await fetch(base + "/api/recovery/restore", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pointId: f.json.point.id, restoreId: rid }),
+    }).catch(() => {});
+    await new Promise((r) => crashChild.on("exit", r));
+
+    // 首次重启：磁盘仍故障 → 待找回，写入被拒
+    child = spawnOne({ RECOVERY_REPLAY_ROLLBACK_FAULT: "1" });
+    await waitReady(child);
+    const st = (await req(base, "/api/recovery/status")).json;
+    assert.equal(st.writable, false);
+    const blocked = await req(base, "/api/items", { method: "POST", body: JSON.stringify({ code: "Q-X" }) });
+    assert.equal(blocked.status, 409);
+    assert.equal(blocked.json.error, "rollback_in_progress");
+    assert.equal((await req(base, "/api/items")).status, 200, "读取仍可用");
+
+    // 磁盘恢复：再次重启，重演回滚成功 → 找回数据、写入放行
+    child.kill("SIGTERM");
+    await new Promise((r) => child.on("exit", r));
+    child = spawnOne();
+    await waitReady(child);
+    const st2 = (await req(base, "/api/recovery/status")).json;
+    assert.equal(st2.writable, true);
+    const items = (await req(base, "/api/items")).json;
+    assert.ok(items.some((i) => i.code === "Q-01"), "恢复前数据找回");
+    const okWrite = await req(base, "/api/items", { method: "POST", body: JSON.stringify({ code: "Q-AFTER" }) });
+    assert.equal(okWrite.status, 201);
+    child.kill("SIGTERM");
+    await new Promise((r) => child.on("exit", r));
+  } finally {
+    await stopAll();
+    await rm(dir, { recursive: true, force: true });
   }
 });
