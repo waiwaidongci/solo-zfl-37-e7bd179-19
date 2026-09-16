@@ -1,14 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, rm, cp } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { createServer } from "node:net";
+import { fileURLToPath } from "node:url";
 import { canonical, sha256 } from "../lib/recovery.js";
 
-const SERVER = new URL("../server.js", import.meta.url).pathname;
+// fileURLToPath 解码 %20 等：项目路径含空格时，子进程收到的必须是真实文件系统路径
+const SERVER = fileURLToPath(new URL("../server.js", import.meta.url));
 /** 按引擎同样的规则计算恢复点自摘要（不含 digest 与 payload） */
 const pointDigest = (p) =>
   sha256(canonical({
@@ -66,12 +68,42 @@ async function startServer(env = {}) {
   };
 }
 
+/** 启动一个指定 server.js 路径（可在含空格的目录）的服务进程 */
+async function startServerFile(serverPath, env = {}) {
+  const dir = await mkdtemp(join(tmpdir(), "ink-recovery-"));
+  const port = await freePort();
+  const child = spawn(process.execPath, [serverPath], {
+    env: { ...process.env, DATA_DIR: dir, PORT: String(port), ...env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let logs = "";
+  child.stdout.on("data", (d) => (logs += d));
+  child.stderr.on("data", (d) => (logs += d));
+  const base = `http://127.0.0.1:${port}`;
+  await new Promise((resolve, reject) => {
+    const deadline = Date.now() + 8000;
+    const tick = async () => {
+      try {
+        const res = await fetch(base + "/api/items");
+        if (res.ok) return resolve();
+      } catch {}
+      if (Date.now() > deadline) return reject(new Error("server not ready: " + serverPath + "\n" + logs));
+      setTimeout(tick, 60);
+    };
+    tick();
+  });
+  return {
+    dir, base,
+    logs: () => logs,
+    stop: async () => { child.kill("SIGTERM"); await new Promise((r) => child.on("exit", r)); },
+  };
+}
+
 async function req(base, path, opts = {}) {
   const res = await fetch(base + path, {
     ...opts,
     headers: opts.body ? { "Content-Type": "application/json", ...opts.headers } : opts.headers,
-  });
-  const json = await res.json().catch(() => ({}));
+  });  const json = await res.json().catch(() => ({}));
   return { status: res.status, json };
 }
 const createItem = (base, code, extra = {}) =>
@@ -635,6 +667,266 @@ test("页面可访问且包含恢复台操作（桌面/移动视口由响应式�
       }
     }
   } finally {
+    await srv.stop();
+  }
+});
+
+/* ================= 缺陷回归：含空格路径 / 回滚写失败 / 窄屏溢出 ================= */
+
+test("缺陷1回归：项目路径含空格（编码路径）时服务可启动、接口可用", async () => {
+  // 把项目复制到带空格的目录，server.js / lib 必须按解码后的真实路径加载
+  const spaceRoot = await mkdtemp(join(tmpdir(), "ink space project-"));
+  await cp(join(dirname(SERVER)), spaceRoot, {
+    recursive: true,
+    filter: (src) => !/[\\/]node_modules[\\/]/.test(src) && !/[\\/]data[\\/]recovery[\\/]/.test(src),
+  });
+  const spacedServer = join(spaceRoot, "server.js");
+  const srv = await startServerFile(spacedServer);
+  try {
+    const items = await req(srv.base, "/api/items");
+    assert.equal(items.status, 200);
+    assert.ok(Array.isArray(items.json));
+    const overview = await req(srv.base, "/api/recovery/overview");
+    assert.equal(overview.status, 200);
+    // 建点也走通，证明从含空格路径加载了 lib/recovery.js
+    const created = await req(srv.base, "/api/recovery/points", {
+      method: "POST",
+      body: JSON.stringify({ kind: "full" }),
+    });
+    assert.equal(created.status, 201);
+    // 恢复台页面也由该进程提供
+    const pageRes = await fetch(srv.base + "/recovery");
+    assert.equal(pageRes.status, 200);
+  } finally {
+    await srv.stop();
+    await rm(spaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("缺陷2回归-运行时：回滚写入失败不误报已回滚，保留备份并可重试找回", async () => {
+  const srv = await startServer({ RECOVERY_FAULT: "after_write", RECOVERY_ROLLBACK_FAULT: "1" });
+  try {
+    const f = await makePoint(srv.base, "full", "回滚失败基线");
+    await createItem(srv.base, "K-01");
+    await createItem(srv.base, "K-02");
+    const pre = (await req(srv.base, "/api/items")).json;
+    assert.equal(pre.length, 4);
+    const preCodes = pre.map((i) => i.code).sort();
+
+    const rid = "rb-fail-runtime-001";
+    const r = await req(srv.base, "/api/recovery/restore", {
+      method: "POST",
+      body: JSON.stringify({ pointId: f.json.point.id, restoreId: rid }),
+    });
+    // 恢复失败且回滚也失败 → 500 rollback_incomplete（不再误报 restore_failed_rolled_back）
+    assert.equal(r.status, 500);
+    assert.equal(r.json.error, "rollback_incomplete");
+
+    // 日志为 rollback_failed（不是 rolled_back），备份仍在
+    let journal = (await req(srv.base, "/api/recovery/restore/" + rid)).json;
+    assert.equal(journal.status, "rollback_failed");
+    assert.ok(journal.rollbackError);
+    assert.ok(
+      existsSync(join(srv.dir, "recovery", `backup-${rid}.json`)),
+      "回滚失败后备份必须保留"
+    );
+    // 待重试回滚在状态/总览中可见
+    const st = (await req(srv.base, "/api/recovery/status")).json;
+    assert.ok(st.pendingRollbacks.some((j) => j.restoreId === rid));
+
+    // 同一 rid 仍不能发起新恢复（被未完成回滚挡住）
+    const blocked = await req(srv.base, "/api/recovery/restore", {
+      method: "POST",
+      body: JSON.stringify({ pointId: f.json.point.id, restoreId: rid }),
+    });
+    assert.equal(blocked.status, 409);
+    assert.equal(blocked.json.error, "rollback_incomplete");
+
+    // 重试回滚（同一进程，无故障注入）→ 找回恢复前数据
+    const rec = await req(srv.base, `/api/recovery/restore/${rid}/recover-rollback`, {
+      method: "POST",
+    });
+    assert.equal(rec.status, 200);
+    assert.equal(rec.json.journal.status, "rolled_back");
+    const after = (await req(srv.base, "/api/items")).json;
+    assert.deepEqual(after.map((i) => i.code).sort(), preCodes, "找回恢复前的 4 条数据");
+    assert.ok(!existsSync(join(srv.dir, "recovery", `backup-${rid}.json`)), "成功后备份清理");
+    journal = (await req(srv.base, "/api/recovery/restore/" + rid)).json;
+    assert.equal(journal.status, "rolled_back");
+  } finally {
+    await srv.stop();
+  }
+});
+
+test("缺陷2回归-重启：崩溃后首次重启回滚失败保留备份，磁盘恢复再重启/重试找回", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ink-rb-crash-"));
+  const port = await freePort();
+  const base = `http://127.0.0.1:${port}`;
+  const children = new Set();
+  const spawnOne = (extra = {}) => {
+    const c = spawn(process.execPath, [SERVER], {
+      env: { ...process.env, DATA_DIR: dir, PORT: String(port), ...extra },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    children.add(c);
+    c.on("exit", () => children.delete(c));
+    return c;
+  };
+  const stopAll = async () => {
+    for (const c of children) c.kill("SIGTERM");
+    await Promise.all([...children].map((c) => new Promise((r) => c.on("exit", r)))).catch(() => {});
+  };
+  const waitReady = async (child) => {
+    let err = "";
+    child.stderr.on("data", (d) => (err += d));
+    await new Promise((resolve, reject) => {
+      const deadline = Date.now() + 8000;
+      (async function tick() {
+        try {
+          const res = await fetch(base + "/api/items");
+          if (res.ok) return resolve();
+        } catch {}
+        if (Date.now() > deadline) return reject(new Error("not ready: " + err));
+        setTimeout(tick, 60);
+      })();
+    });
+  };
+
+  try {
+    let child = spawnOne();
+    await waitReady(child);
+    const f = await req(base, "/api/recovery/points", { method: "POST", body: JSON.stringify({ kind: "full" }) });
+    await createItem(base, "L-01");
+    const preCodes = (await req(base, "/api/items")).json.map((i) => i.code).sort();
+
+    // 恢复落盘后直接崩溃 → 残留 in_progress + 备份
+    child.kill("SIGTERM");
+    await new Promise((r) => child.on("exit", r));
+    const crashChild = spawnOne({ RECOVERY_CRASH: "after_write" });
+    await waitReady(crashChild);
+    const rid = "rb-fail-restart-0001";
+    await fetch(base + "/api/recovery/restore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pointId: f.json.point.id, restoreId: rid }),
+    }).catch(() => {});
+    await new Promise((r) => crashChild.on("exit", r));
+    assert.ok(existsSync(join(dir, "recovery", `backup-${rid}.json`)));
+
+    // 第一次重启：磁盘仍故障，重演回滚失败 → rollback_failed，备份仍在
+    child = spawnOne({ RECOVERY_REPLAY_ROLLBACK_FAULT: "1" });
+    await waitReady(child);
+    let journal = (await req(base, "/api/recovery/restore/" + rid)).json;
+    assert.equal(journal.status, "rollback_failed", "回滚失败不能误报已回滚");
+    assert.ok(existsSync(join(dir, "recovery", `backup-${rid}.json`)), "备份保留，数据未丢");
+    const pending = (await req(base, "/api/recovery/status")).json.pendingRollbacks;
+    assert.ok(pending.some((j) => j.restoreId === rid));
+
+    // 此时在线重试回滚（注入仍在，会失败）
+    const failAgain = await req(base, `/api/recovery/restore/${rid}/recover-rollback`, { method: "POST" });
+    assert.equal(failAgain.status, 500);
+
+    // 磁盘恢复：重启后重演成功 → 回到恢复前
+    child.kill("SIGTERM");
+    await new Promise((r) => child.on("exit", r));
+    child = spawnOne();
+    await waitReady(child);
+    const after = (await req(base, "/api/items")).json;
+    assert.deepEqual(after.map((i) => i.code).sort(), preCodes, "重启后找回恢复前数据");
+    journal = (await req(base, "/api/recovery/restore/" + rid)).json;
+    assert.equal(journal.status, "rolled_back");
+    assert.ok(!existsSync(join(dir, "recovery", `backup-${rid}.json`)));
+
+    child.kill("SIGTERM");
+    await new Promise((r) => child.on("exit", r));
+  } finally {
+    await stopAll();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("缺陷3回归：手机窄屏无横向溢出，恢复点表格/按钮/状态留在屏内", { skip: false }, async (t) => {
+  const { createRequire } = await import("node:module");
+  const { homedir } = await import("node:os");
+  const candidates = [
+    process.env.PLAYWRIGHT_CORE_DIR && join(process.env.PLAYWRIGHT_CORE_DIR, "playwright-core"),
+    "/tmp/pw/node_modules/playwright-core",
+    join(dirname(SERVER), "node_modules", "playwright-core"),
+  ].filter(Boolean);
+  let chromium = null;
+  for (const c of candidates) {
+    try { ({ chromium } = createRequire(join(c, "package.json"))(c)); break; } catch {}
+  }
+  if (!chromium) return t.skip("playwright-core 不可用，跳过真实浏览器布局测试");
+  const exe = process.env.CHROME_HEADLESS_SHELL
+    || join(homedir(), ".cache/ms-playwright/chromium_headless_shell-1243/chrome-headless-shell-linux-arm64/chrome-headless-shell");
+  // 免 root 解压的浏览器依赖库（若存在）加入库搜索路径
+  for (const libDir of ["/tmp/browser-libs/usr/lib/aarch64-linux-gnu", "/tmp/browser-libs/lib/aarch64-linux-gnu"]) {
+    if (existsSync(libDir)) process.env.LD_LIBRARY_PATH = [libDir, process.env.LD_LIBRARY_PATH].filter(Boolean).join(":");
+  }
+  const launchOpts = existsSync(exe) ? { executablePath: exe, args: ["--no-sandbox"] } : { args: ["--no-sandbox"] };
+
+  const srv = await startServer();
+  let browser;
+  try {
+    // 准备多个恢复点，让窄屏表格有多行（含钉住、全量/增量）
+    await req(srv.base, "/api/recovery/points", { method: "POST", body: JSON.stringify({ kind: "full", note: "手机布局基线" }) });
+    await createItem(srv.base, "MOB-01");
+    await req(srv.base, "/api/recovery/points", { method: "POST", body: JSON.stringify({ kind: "incremental", note: "移动端增量点" }) });
+
+    try {
+      browser = await chromium.launch(launchOpts);
+    } catch (e) {
+      await srv.stop();
+      return t.skip("无可用无头浏览器（" + String(e.message).slice(0, 80) + "），跳过真实布局测试");
+    }
+    for (const width of [320, 360]) {
+      const page = await browser.newPage({ viewport: { width, height: 760 }, deviceScaleFactor: 1 });
+      await page.goto(srv.base + "/recovery", { waitUntil: "networkidle" });
+      await page.waitForTimeout(200);
+      const rec = await page.evaluate(() => {
+        const docW = document.documentElement.clientWidth;
+        const offenders = [];
+        for (const el of document.querySelectorAll("body *")) {
+          const r = el.getBoundingClientRect();
+          if (r.width && (r.right > docW + 1 || r.left < -1))
+            offenders.push((el.id || el.tagName) + ":" + Math.round(r.right));
+        }
+        // 每个操作按钮与状态文字都必须在屏内可见
+        const firstRow = document.querySelector("#rows tr");
+        const buttons = [...document.querySelectorAll("#rows button")].slice(0, 4).map((b) => {
+          const r = b.getBoundingClientRect();
+          return { text: b.textContent.trim(), right: Math.round(r.right), visible: r.right <= docW + 1 && r.left >= -1 };
+        });
+        const tableWrap = document.querySelector(".tablewrap");
+        return {
+          docW,
+          scrollW: document.documentElement.scrollWidth,
+          noOverflow: document.documentElement.scrollWidth <= docW + 1,
+          offenders,
+          buttons,
+          wrapWithin: tableWrap ? tableWrap.getBoundingClientRect().right <= docW + 1 : null,
+        };
+      });
+      assert.equal(rec.noOverflow, true, `恢复台 ${width}px 不横向溢出（scrollW=${rec.scrollW}）`);
+      assert.equal(rec.offenders.length, 0, `恢复台 ${width}px 无越界元素：${rec.offenders.slice(0, 5)}`);
+      assert.ok(rec.buttons.length >= 4, "每行四个操作按钮");
+      assert.ok(rec.buttons.every((b) => b.visible), `按钮留在屏内：${JSON.stringify(rec.buttons)}`);
+      assert.equal(rec.wrapWithin, true, "表格限制在自身区域内");
+      await page.close();
+
+      const home = await browser.newPage({ viewport: { width, height: 760 } });
+      await home.goto(srv.base + "/", { waitUntil: "networkidle" });
+      await home.waitForTimeout(200);
+      const hm = await home.evaluate(() => ({
+        docW: document.documentElement.clientWidth,
+        scrollW: document.documentElement.scrollWidth,
+      }));
+      assert.equal(hm.scrollW <= hm.docW + 1, true, `主页 ${width}px 不横向溢出（scrollW=${hm.scrollW}）`);
+      await home.close();
+    }
+  } finally {
+    await browser?.close();
     await srv.stop();
   }
 });

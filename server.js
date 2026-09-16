@@ -116,9 +116,14 @@ function findItem(ref) {
 
 /* ---------------- 恢复 ---------------- */
 
-// 故障注入（仅测试用）：RECOVERY_FAULT=after_write 落盘后抛错；RECOVERY_CRASH=after_write 直接退出
+// 故障注入（仅测试用）：
+// RECOVERY_FAULT=after_write 恢复落盘后抛错；RECOVERY_CRASH=after_write 直接退出；
+// RECOVERY_ROLLBACK_FAULT=1 让同次恢复的回滚写入也失败；RECOVERY_REPLAY_ROLLBACK_FAULT=1 让启动重演回滚失败
 const faultPhase = process.env.RECOVERY_FAULT || null;
 const crashPhase = process.env.RECOVERY_CRASH || null;
+const rollbackFault = process.env.RECOVERY_ROLLBACK_FAULT === "1";
+const replayRollbackFault = process.env.RECOVERY_REPLAY_ROLLBACK_FAULT === "1";
+const recoverRollbackFault = process.env.RECOVERY_RECOVER_ROLLBACK_FAULT === "1" || replayRollbackFault;
 
 let inflightRestore = null; // { rid, promise }
 
@@ -146,11 +151,15 @@ async function runRestore(restoreId, pointId) {
     // 取得写锁：在途写入已排空，备份即恢复前一致状态；此后到替换完成期间无其它写入
     try {
       const backupContent = { items: JSON.parse(JSON.stringify(db.items)) };
+      let writes = 0;
       const result = await engine.restore({
         restoreId,
         pointId,
         backupContent,
         writeDb: async (content) => {
+          writes += 1;
+          // 回滚写入（第 2 次写）按注入失败，模拟回滚落盘故障
+          if (rollbackFault && writes === 2) throw new Error("注入的回滚写入故障");
           await persist(content);
           await loadDbFromDisk();
         },
@@ -205,20 +214,24 @@ function page() {
   <title>墨锭试磨室</title>
   <style>
     :root { --bg:#f1f3ef; --panel:#fff; --ink:#20241f; --muted:#687066; --line:#d4ddd0; --accent:#526f43; --warn:#9b4937; }
-    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--ink); font-family:Arial,"PingFang SC",sans-serif; }
+    * { box-sizing:border-box; }
+    html,body { max-width:100%; overflow-x:hidden; }
+    body { margin:0; background:var(--bg); color:var(--ink); font-family:Arial,"PingFang SC",sans-serif; }
     header { padding:22px 28px; background:#fff; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:16px; align-items:center; }
-    h1 { margin:0; font-size:26px; } h2 { margin:0 0 12px; font-size:18px; } main { display:grid; grid-template-columns:380px 1fr; gap:22px; padding:22px 28px; }
-    form,.panel,.card,.stat { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
-    label { display:block; margin:10px 0 5px; color:var(--muted); font-size:13px; } input,select,textarea { width:100%; border:1px solid var(--line); border-radius:6px; padding:9px; font:inherit; background:#fff; } textarea { min-height:68px; }
-    button { border:0; border-radius:6px; background:var(--accent); color:#fff; padding:10px 13px; font-weight:700; cursor:pointer; } button.secondary { background:#69736a; }
+    header > div { min-width:0; }
+    h1 { margin:0; font-size:26px; word-break:break-word; } h2 { margin:0 0 12px; font-size:18px; } main { display:grid; grid-template-columns:380px minmax(0,1fr); gap:22px; padding:22px 28px; }
+    section { min-width:0; }
+    form,.panel,.card,.stat { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; min-width:0; }
+    label { display:block; margin:10px 0 5px; color:var(--muted); font-size:13px; } input,select,textarea { width:100%; max-width:100%; border:1px solid var(--line); border-radius:6px; padding:9px; font:inherit; background:#fff; } textarea { min-height:68px; }
+    button { border:0; border-radius:6px; background:var(--accent); color:#fff; padding:10px 13px; font-weight:700; cursor:pointer; max-width:100%; } button.secondary { background:#69736a; }
     .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:14px; } .stat strong { display:block; font-size:24px; }
-    .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; } .toolbar select,.toolbar input { width:auto; min-width:160px; }
-    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; } .card { display:grid; gap:8px; }
-    .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
-    .logs { border-top:1px solid var(--line); padding-top:8px; max-height:90px; overflow:auto; } .warn { color:var(--warn); font-weight:700; }
+    .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; } .toolbar select,.toolbar input { width:auto; min-width:160px; max-width:100%; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(100%,280px),1fr)); gap:12px; } .card { display:grid; gap:8px; }
+    .meta { color:var(--muted); font-size:13px; word-break:break-word; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
+    .logs { border-top:1px solid var(--line); padding-top:8px; max-height:90px; overflow:auto; word-break:break-word; } .warn { color:var(--warn); font-weight:700; }
     #restoreBanner { display:none; margin:0; padding:10px 28px; background:#f6e3dd; color:var(--warn); font-weight:700; }
     a.navlink { color:var(--accent); font-weight:700; text-decoration:none; border:1px solid var(--accent); border-radius:6px; padding:8px 12px; white-space:nowrap; }
-    @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} .navlink{display:inline-block;margin-top:10px;} #restoreBanner{padding:10px 16px;} }
+    @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:minmax(0,1fr);padding:16px;} .navlink{display:inline-block;margin-top:10px;} #restoreBanner{padding:10px 16px;} .toolbar{flex-direction:column;align-items:stretch;} .toolbar select,.toolbar input{width:100%;min-width:0;} }
   </style>
 </head>
 <body>
@@ -359,12 +372,20 @@ const server = http.createServer(async (req, res) => {
 
     /* ---- 数据恢复台 ---- */
     if (req.method === "GET" && p === "/api/recovery/status") {
-      const journals = await engine.listJournals();
-      return send(res, 200, { restoreActive, journals: journals.slice(0, 10) });
+      const [journals, pendingRollbacks] = await Promise.all([
+        engine.listJournals(),
+        engine.listPendingRollbacks(),
+      ]);
+      return send(res, 200, {
+        restoreActive,
+        journals: journals.slice(0, 10),
+        pendingRollbacks,
+      });
     }
     if (req.method === "GET" && p === "/api/recovery/overview") {
       const list = await engine.list();
-      return send(res, 200, { ...list, restoreActive });
+      const pendingRollbacks = await engine.listPendingRollbacks();
+      return send(res, 200, { ...list, restoreActive, pendingRollbacks });
     }
     if (req.method === "GET" && p === "/api/recovery/points") {
       const list = await engine.list();
@@ -430,6 +451,21 @@ const server = http.createServer(async (req, res) => {
       if (!j) return send(res, 404, { error: "journal_not_found" });
       return send(res, 200, j);
     }
+    const retryRollbackRoute = p.match(/^\/api\/recovery\/restore\/([^/]+)\/recover-rollback$/);
+    if (retryRollbackRoute && req.method === "POST") {
+      const rid = decodeURIComponent(retryRollbackRoute[1]);
+      await assertNotRestoring();
+      const result = await writeLock.run(() =>
+        engine.recoverRollback(rid, {
+          writeDb: async (content) => {
+            if (recoverRollbackFault) throw new Error("注入的重试回滚写入故障");
+            await persist(content);
+            await loadDbFromDisk();
+          },
+        })
+      );
+      return send(res, 200, result);
+    }
 
     send(res, 404, { error: "not_found" });
   } catch (error) {
@@ -441,9 +477,14 @@ const server = http.createServer(async (req, res) => {
 async function start() {
   await engine.cleanupTemp();
   await initStorage();
-  // 启动时重演：上次在恢复中崩溃/中断 → 用备份回到恢复前状态
+  // 启动时重演：上次在恢复中崩溃/中断 → 用备份回到恢复前状态；
+  // 若回滚写入也失败（如磁盘未恢复），保留备份并标记 rollback_failed，磁盘恢复后可经重试端点找回
   const replay = await engine.replayJournals({
-    writeDb: async (content) => { await persist(content); await loadDbFromDisk(); },
+    writeDb: async (content) => {
+      if (replayRollbackFault) throw new Error("注入的启动重演回滚故障");
+      await persist(content);
+      await loadDbFromDisk();
+    },
   });
   for (const r of replay.recovered) console.log("[recovery] 中断恢复处理：", JSON.stringify(r));
   server.listen(port, () => console.log("墨锭试磨室 listening on http://localhost:" + port));
