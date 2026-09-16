@@ -1,12 +1,18 @@
 import http from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
+import { RecoveryEngine, RecoveryError, atomicWrite } from "./lib/recovery.js";
+import { recoveryPage } from "./lib/recovery-page.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const dbPath = join(__dirname, "data", "ink-stick-testing.json");
+const dataDir = process.env.DATA_DIR || join(__dirname, "data");
+const dbPath = join(dataDir, "ink-stick-testing.json");
+const recoveryDir = join(dataDir, "recovery");
 const port = Number(process.env.PORT || 3037);
+
 const seed = {
   "items": [
     {
@@ -17,12 +23,7 @@ const seed = {
       "storage": "恒湿柜B",
       "status": "已试磨",
       "logs": [
-        {
-          "at": "2026-06-11",
-          "step": "试磨",
-          "note": "宣纸20滴水，出墨快，评分86",
-          "score": 86
-        }
+        { "at": "2026-06-11", "step": "试磨", "note": "宣纸20滴水，出墨快，评分86", "score": 86 }
       ]
     },
     {
@@ -39,20 +40,150 @@ const seed = {
 const fields = [["code","墨锭编号","text"],["smokeSource","烟料来源","text"],["glueRatio","胶料比例","text"],["ageYears","存放年限","number"],["storage","存放位置","text"]];
 const stages = ["待试磨","已试磨","重点观察"];
 const statLabels = ["待试磨","已试磨","重点观察"];
-const extraFields = [["paper","试磨纸张"],["water","加水量"],["speed","出墨速度"],["colorLayer","墨色层次"],["sediment","沉淀情况"],["score","评分"]];
 
-async function loadDb() {
-  if (!existsSync(dbPath)) {
-    await mkdir(dirname(dbPath), { recursive: true });
-    await writeFile(dbPath, JSON.stringify(seed, null, 2));
+class Mutex {
+  constructor() { this.queue = Promise.resolve(); }
+  run(fn) {
+    const run = this.queue.then(fn, fn);
+    this.queue = run.then(() => {}, () => {});
+    return run;
   }
-  return JSON.parse(await readFile(dbPath, "utf8"));
 }
-async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2)); }
+
+const writeLock = new Mutex();
+let db = { items: [] };
+let restoreActive = null; // 恢复进行中时保存 restoreId
+let idCounter = 0;
+
+const engine = new RecoveryEngine({ dir: recoveryDir });
+
+/* ---------------- 存储 ---------------- */
+
+function normalizeItem(item) {
+  if (item.id == null) item.id = item.code;
+  return item;
+}
+
+async function persist(content) {
+  await atomicWrite(dbPath, content);
+}
+
+async function loadDbFromDisk() {
+  const data = JSON.parse(await readFile(dbPath, "utf8"));
+  data.items ||= [];
+  data.items.forEach(normalizeItem);
+  db = data;
+}
+
+async function initStorage() {
+  if (!existsSync(dbPath)) {
+    await atomicWrite(dbPath, seed);
+  }
+  await loadDbFromDisk();
+}
+
+/**
+ * 所有写操作经此入口：恢复期间一律拒绝；否则串行化并原子落盘。
+ */
+async function mutate(fn) {
+  if (restoreActive)
+    throw new RecoveryError(409, "restore_in_progress", "数据恢复进行中，期间禁止写入");
+  return writeLock.run(async () => {
+    if (restoreActive)
+      throw new RecoveryError(409, "restore_in_progress", "数据恢复进行中，期间禁止写入");
+    const result = await fn();
+    await persist({ items: db.items });
+    return result;
+  });
+}
+
+function newId() {
+  idCounter += 1;
+  return "IS-" + Date.now() + "-" + idCounter.toString(36) + randomUUID().slice(0, 4);
+}
+function computeStats(items) {
+  const stats = Object.fromEntries(statLabels.map(label => [label, 0]));
+  for (const item of items) if (stats[item.status] !== undefined) stats[item.status] += 1;
+  return stats;
+}
+function summarize(item) {
+  const logCount = (item.logs || []).length + (item.tests || []).reduce((n, t) => n + 1, 0) + (item.tasks || []).reduce((n, t) => n + (t.logs || []).length, 0);
+  return { ...item, logCount };
+}
+function findItem(ref) {
+  return db.items.find(x => x.id === ref || x.code === ref);
+}
+
+/* ---------------- 恢复 ---------------- */
+
+// 故障注入（仅测试用）：RECOVERY_FAULT=after_write 落盘后抛错；RECOVERY_CRASH=after_write 直接退出
+const faultPhase = process.env.RECOVERY_FAULT || null;
+const crashPhase = process.env.RECOVERY_CRASH || null;
+
+let inflightRestore = null; // { rid, promise }
+
+async function performRestore(restoreId, pointId) {
+  // 同一个恢复请求并发到达：共用同一次执行，重复请求只执行一次
+  if (inflightRestore) {
+    if (inflightRestore.rid !== restoreId)
+      throw new RecoveryError(409, "restore_in_progress", "已有恢复正在进行：" + inflightRestore.rid);
+    const result = await inflightRestore.promise;
+    return { ...result, deduplicated: true, coalesced: true };
+  }
+  // 在排队取锁之前同步置位：排空在途写入的同时，新写入立刻失败，不存在漏网窗口
+  restoreActive = restoreId;
+  const promise = runRestore(restoreId, pointId);
+  inflightRestore = { rid: restoreId, promise };
+  try {
+    return await promise;
+  } finally {
+    inflightRestore = null;
+  }
+}
+
+async function runRestore(restoreId, pointId) {
+  return writeLock.run(async () => {
+    // 取得写锁：在途写入已排空，备份即恢复前一致状态；此后到替换完成期间无其它写入
+    try {
+      const backupContent = { items: JSON.parse(JSON.stringify(db.items)) };
+      const result = await engine.restore({
+        restoreId,
+        pointId,
+        backupContent,
+        writeDb: async (content) => {
+          await persist(content);
+          await loadDbFromDisk();
+        },
+        inject: async (phase) => {
+          if (crashPhase === phase) process.exit(33);
+          if (faultPhase === phase) throw new Error("注入的恢复故障");
+          if (process.env.RECOVERY_HOLD === phase)
+            await new Promise(r => setTimeout(r, Number(process.env.RECOVERY_HOLD_MS || 800)));
+        },
+      });
+      return result;
+    } finally {
+      restoreActive = null;
+    }
+  });
+}
+
+async function assertNotRestoring() {
+  if (restoreActive)
+    throw new RecoveryError(409, "restore_in_progress", "数据恢复进行中，该操作暂不可用");
+}
+
+/* ---------------- HTTP 辅助 ---------------- */
+
 async function body(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
-  return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
+  if (!chunks.length) return {};
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw new RecoveryError(400, "bad_json", "请求体不是合法 JSON");
+  }
 }
 function send(res, status, data) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -62,18 +193,9 @@ function html(res, text) {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(text);
 }
-function newId() { return "IS-" + Date.now(); }
-function computeStats(items) {
-  const stats = Object.fromEntries(statLabels.map(label => [label, 0]));
-  for (const item of items) {
-    if (stats[item.status] !== undefined) stats[item.status] += 1;
-  }
-  return stats;
-}
-function summarize(item) {
-  const logCount = (item.logs || []).length + (item.tasks || []).reduce((n, t) => n + (t.logs || []).length, 0);
-  return { ...item, logCount };
-}
+
+/* ---------------- 主页 ---------------- */
+
 function page() {
   return `<!doctype html>
 <html lang="zh-CN">
@@ -94,15 +216,18 @@ function page() {
     .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; } .card { display:grid; gap:8px; }
     .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
     .logs { border-top:1px solid var(--line); padding-top:8px; max-height:90px; overflow:auto; } .warn { color:var(--warn); font-weight:700; }
-    @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} }
+    #restoreBanner { display:none; margin:0; padding:10px 28px; background:#f6e3dd; color:var(--warn); font-weight:700; }
+    a.navlink { color:var(--accent); font-weight:700; text-decoration:none; border:1px solid var(--accent); border-radius:6px; padding:8px 12px; white-space:nowrap; }
+    @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} .navlink{display:inline-block;margin-top:10px;} #restoreBanner{padding:10px 16px;} }
   </style>
 </head>
 <body>
-  <header><div><h1>墨锭试磨室</h1><div class="meta">墨锭建档、试磨记录和评分统计</div></div><button id="reload">刷新</button></header>
+  <header><div><h1>墨锭试磨室</h1><div class="meta">墨锭建档、试磨记录和评分统计</div></div><div style="display:flex;gap:10px;align-items:center"><a class="navlink" href="/recovery">数据恢复台</a><button id="reload">刷新</button></div></header>
+  <div id="restoreBanner"></div>
   <main>
     <section>
-      <form id="createForm"><h2>新增墨锭</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存墨锭</button></form>
-      <form id="actionForm" style="margin-top:14px"><h2>创建试磨记录</h2><label>选择墨锭</label><select name="id" id="itemSelect"></select><div id="extraFields"></div><button>提交记录</button></form>
+      <form id="createForm"><h2>新增墨锭</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><p style="margin-top:12px"><button>保存墨锭</button></p></form>
+      <form id="actionForm" style="margin-top:14px"><h2>创建试磨记录</h2><label>选择墨锭</label><select name="id" id="itemSelect"></select><div id="extraFields"></div><p style="margin-top:12px"><button>提交记录</button></p></form>
     </section>
     <section>
       <div class="stats" id="stats"></div>
@@ -119,6 +244,7 @@ function page() {
     const cards = document.querySelector('#cards');
     const statsEl = document.querySelector('#stats');
     const itemSelect = document.querySelector('#itemSelect');
+    const banner = document.querySelector('#restoreBanner');
     let items = [];
     async function api(path, options) {
       const res = await fetch(path, options && options.body ? { ...options, headers:{ 'Content-Type':'application/json' } } : options);
@@ -131,7 +257,7 @@ function page() {
       document.querySelector('#extraFields').innerHTML = extraFields.map(([key,label]) => '<label>'+label+'</label><input name="'+key+'">').join('');
     }
     function render() {
-      itemSelect.innerHTML = items.map(item => '<option value="'+(item.id || item.code)+'">'+(item.code || item.id)+' · '+(item.name || item.shipType || item.source || item.plateSize || '')+'</option>').join('');
+      itemSelect.innerHTML = items.map(item => '<option value="'+(item.id || item.code)+'">'+(item.code || item.id)+' · '+(item.smokeSource || item.name || '')+'</option>').join('');
       const stats = Object.fromEntries(stages.map(s => [s, items.filter(i => i.status === s).length]));
       statsEl.innerHTML = Object.entries(stats).map(([k,v]) => '<div class="stat"><span>'+k+'</span><strong>'+v+'</strong></div>').join('');
       const status = document.querySelector('#statusFilter').value;
@@ -143,72 +269,184 @@ function page() {
     }
     function cardHtml(item) {
       const main = fields.slice(0,4).map(([key,label]) => '<div><b>'+label+'</b> '+(item[key] ?? '')+'</div>').join('');
-      const tasks = (item.tasks || []).map(t => '<div class="meta">任务 '+t.position+' · '+t.status+' · '+t.tension+'</div>').join('');
       const logs = (item.logs || []).slice(-4).map(l => '<div>'+l.step+'：'+l.note+'</div>').join('');
-      return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
+      return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
     }
-    async function load() { items = await api('/api/items'); render(); }
-    createForm.onsubmit = async event => { event.preventDefault(); await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); };
-    actionForm.onsubmit = async event => { event.preventDefault(); await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) }); actionForm.reset(); await load(); };
+    async function load() { try { items = await api('/api/items'); render(); } catch(e){} pollRestore(); }
+    async function pollRestore() {
+      try {
+        const st = await api('/api/recovery/status');
+        if (st.restoreActive) { banner.style.display='block'; banner.textContent='⚠ 数据恢复进行中（'+st.restoreActive+'），所有写入已暂停'; }
+        else banner.style.display='none';
+      } catch {}
+    }
+    createForm.onsubmit = async event => { event.preventDefault(); try { await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); } catch(e){ alert(e.message); } };
+    actionForm.onsubmit = async event => { event.preventDefault(); try { await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) }); actionForm.reset(); await load(); } catch(e){ alert(e.message); } };
     document.querySelector('#statusFilter').onchange = render; document.querySelector('#search').oninput = render; document.querySelector('#reload').onclick = load;
-    renderForms(); load();
+    renderForms(); load(); setInterval(pollRestore, 3000);
   </script>
 </body>
 </html>`;
 }
 
+/* ---------------- 路由 ---------------- */
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const db = await loadDb();
-    if (req.method === "GET" && url.pathname === "/") return html(res, page());
-    if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
-    if (req.method === "POST" && url.pathname === "/api/items") {
+    const p = url.pathname;
+
+    if (req.method === "GET" && p === "/") return html(res, page());
+    if (req.method === "GET" && p === "/recovery") return html(res, recoveryPage());
+
+    if (req.method === "GET" && p === "/api/items") return send(res, 200, db.items.map(summarize));
+    if (req.method === "POST" && p === "/api/items") {
       const input = await body(req);
-      const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建墨锭" }] };
-      
-      db.items.unshift(item);
-      await saveDb(db);
+      const item = await mutate(() => {
+        const created = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建墨锭" }] };
+        normalizeItem(created);
+        db.items.unshift(created);
+        return created;
+      });
       return send(res, 201, item);
     }
-    const patch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
+    const patch = p.match(/^\/api\/items\/([^/]+)$/);
     if (patch && req.method === "PATCH") {
-      const item = db.items.find(x => x.id === patch[1] || x.code === patch[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      Object.assign(item, await body(req));
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + item.status });
-      await saveDb(db);
+      const ref = decodeURIComponent(patch[1]);
+      const input = await body(req);
+      delete input.id;
+      const item = await mutate(() => {
+        const target = findItem(ref);
+        if (!target) throw new RecoveryError(404, "item_not_found", "墨锭不存在");
+        Object.assign(target, input);
+        target.logs ||= [];
+        if (input.status) target.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + target.status });
+        return target;
+      });
       return send(res, 200, item);
     }
-    const log = url.pathname.match(/^\/api\/items\/([^/]+)\/logs$/);
-    if (log && req.method === "POST") {
-      const item = db.items.find(x => x.id === log[1] || x.code === log[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
+    const logRoute = p.match(/^\/api\/items\/([^/]+)\/logs$/);
+    if (logRoute && req.method === "POST") {
+      const ref = decodeURIComponent(logRoute[1]);
       const input = await body(req);
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: input.step || "记录", note: input.note || "" });
-      await saveDb(db);
+      const item = await mutate(() => {
+        const target = findItem(ref);
+        if (!target) throw new RecoveryError(404, "item_not_found", "墨锭不存在");
+        target.logs ||= [];
+        target.logs.push({ at: new Date().toISOString(), step: input.step || "记录", note: input.note || "" });
+        return target;
+      });
       return send(res, 201, item);
     }
-    const action = url.pathname.match(/^\/api\/items\/([^/]+)\/action$/);
+    const action = p.match(/^\/api\/items\/([^/]+)\/action$/);
     if (action && req.method === "POST") {
-      const item = db.items.find(x => x.id === action[1] || x.code === action[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
+      const ref = decodeURIComponent(action[1]);
       const input = await body(req);
-      item.logs ||= [];
-      const score = Number(input.score || 0);
-      item.tests ||= [];
-      item.tests.push({ at: new Date().toISOString(), ...input, score });
-      item.status = score >= 85 ? "已试磨" : "重点观察";
-      item.logs.push({ at: new Date().toISOString(), step: "试磨", note: (input.paper || "试纸") + "，评分" + score, score });
-      await saveDb(db);
+      const item = await mutate(() => {
+        const target = findItem(ref);
+        if (!target) throw new RecoveryError(404, "item_not_found", "墨锭不存在");
+        target.logs ||= [];
+        const score = Number(input.score || 0);
+        target.tests ||= [];
+        target.tests.push({ at: new Date().toISOString(), ...input, score });
+        target.status = score >= 85 ? "已试磨" : "重点观察";
+        target.logs.push({ at: new Date().toISOString(), step: "试磨", note: (input.paper || "试纸") + "，评分" + score, score });
+        return target;
+      });
       return send(res, 201, item);
     }
-    if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
+    if (req.method === "GET" && p === "/api/stats") return send(res, 200, computeStats(db.items));
+
+    /* ---- 数据恢复台 ---- */
+    if (req.method === "GET" && p === "/api/recovery/status") {
+      const journals = await engine.listJournals();
+      return send(res, 200, { restoreActive, journals: journals.slice(0, 10) });
+    }
+    if (req.method === "GET" && p === "/api/recovery/overview") {
+      const list = await engine.list();
+      return send(res, 200, { ...list, restoreActive });
+    }
+    if (req.method === "GET" && p === "/api/recovery/points") {
+      const list = await engine.list();
+      return send(res, 200, list);
+    }
+    if (req.method === "POST" && p === "/api/recovery/points") {
+      await assertNotRestoring();
+      const input = await body(req);
+      // 同步抓取当前瞬间快照，随后建点期间业务可继续写
+      const snapshot = JSON.parse(JSON.stringify(db.items));
+      const result = await engine.createPoint({ kind: input.kind || "auto", note: input.note || "" }, snapshot);
+      return send(res, 201, result);
+    }
+    if (req.method === "POST" && p === "/api/recovery/validate") {
+      const report = await engine.inspect();
+      return send(res, report.ok ? 200 : 409, report);
+    }
+    if (req.method === "GET" && p === "/api/recovery/config") {
+      return send(res, 200, await engine.getConfig());
+    }
+    if (req.method === "PUT" && p === "/api/recovery/config") {
+      await assertNotRestoring();
+      const input = await body(req);
+      const cfg = await engine.setConfig(input);
+      const retained = await engine.applyRetention();
+      return send(res, 200, { config: cfg, retained });
+    }
+    const pointRoute = p.match(/^\/api\/recovery\/points\/([^/]+)$/);
+    if (pointRoute && req.method === "GET") {
+      return send(res, 200, await engine.getPoint(decodeURIComponent(pointRoute[1])));
+    }
+    if (pointRoute && req.method === "DELETE") {
+      await assertNotRestoring();
+      return send(res, 200, await engine.deletePoint(decodeURIComponent(pointRoute[1])));
+    }
+    const pinRoute = p.match(/^\/api\/recovery\/points\/([^/]+)\/pin$/);
+    if (pinRoute && req.method === "POST") {
+      await assertNotRestoring();
+      const input = await body(req);
+      return send(res, 200, await engine.pin(decodeURIComponent(pinRoute[1]), input.note || ""));
+    }
+    if (pinRoute && req.method === "DELETE") {
+      await assertNotRestoring();
+      return send(res, 200, await engine.unpin(decodeURIComponent(pinRoute[1])));
+    }
+    const previewRoute = p.match(/^\/api\/recovery\/preview\/([^/]+)$/);
+    if (previewRoute && req.method === "GET") {
+      const current = JSON.parse(JSON.stringify(db.items));
+      const result = await engine.preview(decodeURIComponent(previewRoute[1]), current);
+      return send(res, 200, result);
+    }
+    if (req.method === "POST" && p === "/api/recovery/restore") {
+      const input = await body(req);
+      if (!input.pointId) throw new RecoveryError(400, "point_id_required", "缺少恢复点 ID");
+      const restoreId = input.restoreId || randomUUID();
+      engine.validateRestoreId(restoreId);
+      const result = await performRestore(restoreId, input.pointId);
+      return send(res, 200, result);
+    }
+    const journalRoute = p.match(/^\/api\/recovery\/restore\/([^/]+)$/);
+    if (journalRoute && req.method === "GET") {
+      const j = await engine.getJournal(decodeURIComponent(journalRoute[1]));
+      if (!j) return send(res, 404, { error: "journal_not_found" });
+      return send(res, 200, j);
+    }
+
     send(res, 404, { error: "not_found" });
   } catch (error) {
+    if (error instanceof RecoveryError) return send(res, error.status, { error: error.code, message: error.message, details: error.details });
     send(res, 500, { error: error.message });
   }
 });
-server.listen(port, () => console.log("墨锭试磨室 listening on http://localhost:" + port));
+
+async function start() {
+  await engine.cleanupTemp();
+  await initStorage();
+  // 启动时重演：上次在恢复中崩溃/中断 → 用备份回到恢复前状态
+  const replay = await engine.replayJournals({
+    writeDb: async (content) => { await persist(content); await loadDbFromDisk(); },
+  });
+  for (const r of replay.recovered) console.log("[recovery] 中断恢复处理：", JSON.stringify(r));
+  server.listen(port, () => console.log("墨锭试磨室 listening on http://localhost:" + port));
+}
+
+start();

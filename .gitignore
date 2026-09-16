@@ -17,3 +17,6 @@ coverage/
 .idea/
 .vscode/
 
+
+# 数据恢复台运行时文件
+data/recovery/
